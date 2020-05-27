@@ -2,6 +2,10 @@ import contextlib
 import io
 import os
 import sys
+import time
+import errno
+import ctypes
+import random
 import tempfile
 
 try:
@@ -15,6 +19,8 @@ __version__ = '1.3.0'
 PY2 = sys.version_info[0] == 2
 
 text_type = unicode if PY2 else str  # noqa
+
+transactional_ntfs_supported = True
 
 
 def _path_to_unicode(x):
@@ -65,15 +71,84 @@ else:
     _MOVEFILE_WRITE_THROUGH = 0x8
     _windows_default_flags = _MOVEFILE_WRITE_THROUGH
 
+    try:
+        _CreateTransaction = ctypes.windll.ktmw32.CreateTransaction
+        _CommitTransaction = ctypes.windll.ktmw32.CommitTransaction
+        _MoveFileTransacted = ctypes.windll.kernel32.MoveFileTransactedW
+        _CloseHandle = ctypes.windll.kernel32.CloseHandle
+    except WindowsError:
+        transactional_ntfs_supported = False
+
     def _handle_errors(rv):
         if not rv:
             raise WinError()
+        return True
+
+    def _rename_atomic(src, dst):
+        #  Depreciation warning: transactional NTFS may be dropped in the future:
+        #  https://docs.microsoft.com/en-us/windows/win32/fileio/deprecation-of-txf
+        #  Probably replaceFileW should be used in the future (however, per doc, it is not atomic):
+        #  https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-replacefilew
+
+        if not transactional_ntfs_supported:
+            return False
+
+        ta = _CreateTransaction(None, 0, 0, 0, 0, 1000, 'Atomic rename')
+        if ta == -1:
+            return False
+        try:
+            retry = 0
+            rv = False
+            while not rv and retry < 100:
+                rv = _MoveFileTransacted(_path_to_unicode(src), _path_to_unicode(dst), None, None,
+                                         _MOVEFILE_REPLACE_EXISTING |
+                                         _MOVEFILE_WRITE_THROUGH, ta)
+                if rv:
+                    rv = _CommitTransaction(ta)
+                    break
+                else:
+                    time.sleep(0.001)
+                    retry += 1
+            return rv
+        finally:
+            _CloseHandle(ta)
+
+    def _rename(src, dst):
+
+        if _rename_atomic(src, dst):
+            return True
+
+        # Fall back to "move"
+        retry = 0
+        rv = False
+        while not rv and retry < 100:
+            rv = windll.kernel32.MoveFileExW(
+                _path_to_unicode(src), _path_to_unicode(dst),
+                _windows_default_flags | _MOVEFILE_REPLACE_EXISTING
+            )
+            if not rv:
+                time.sleep(0.001)
+                retry += 1
+        return rv
 
     def _replace_atomic(src, dst):
-        _handle_errors(windll.kernel32.MoveFileExW(
-            _path_to_unicode(src), _path_to_unicode(dst),
-            _windows_default_flags | _MOVEFILE_REPLACE_EXISTING
-        ))
+        # Try atomic or pseudo-atomic rename
+        if _handle_errors(_rename(src, dst)):
+            return
+
+        # Fall back to "move away and replace"
+        try:
+            os.rename(src, dst)
+        except OSError, e:
+            if e.errno != errno.EEXIST:
+                raise
+            old = "%s-%08x" % (dst, random.randint(0, sys.maxint))
+            os.rename(dst, old)
+            os.rename(src, dst)
+            try:
+                os.unlink(old)
+            except Exception:
+                pass
 
     def _move_atomic(src, dst):
         _handle_errors(windll.kernel32.MoveFileExW(
@@ -151,12 +226,13 @@ class AtomicWriter(object):
     @contextlib.contextmanager
     def _open(self, get_fileobject):
         f = None  # make sure f exists even if get_fileobject() fails
+        success = False
         try:
-            success = False
             with get_fileobject(**self._open_kwargs) as f:
                 yield f
                 self.sync(f)
-            self.commit(f)
+                f.close()
+                self.commit(f)
             success = True
         finally:
             if not success:
@@ -165,7 +241,7 @@ class AtomicWriter(object):
                 except Exception:
                     pass
 
-    def get_fileobject(self, suffix="", prefix=tempfile.template, dir=None,
+    def get_fileobject(self, suffix=".atm_tmp", prefix=tempfile.template, dir=None,
                        **kwargs):
         '''Return the temporary file to use.'''
         if dir is None:
